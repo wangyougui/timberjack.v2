@@ -33,6 +33,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -46,11 +47,12 @@ import (
 )
 
 const (
-	backupTimeFormat = "2006-01-02T15-04-05.000"
-	compressSuffix   = ".gz"
-	zstdSuffix       = ".zst"
-	defaultMaxSize   = 100
-	defaultFileMode  = 0o640
+	backupTimeFormat  = "2006-01-02T15-04-05.000"
+	compressSuffix    = ".gz"
+	zstdSuffix        = ".zst"
+	defaultMaxSize    = 100
+	defaultMaxBackUps = 20
+	defaultFileMode   = 0o640
 )
 
 // ensure we always implement io.WriteCloser
@@ -97,6 +99,8 @@ type rotateAt [2]int
 //
 // timberjack assumes only a single process is writing to the log files at a time.
 type Logger struct {
+	clock   Clock
+	pattern *Strftime
 	// Filename is the file to write logs to.  Backup log files will be retained
 	// in the same directory.  It uses <processname>-timberjack.log in
 	// os.TempDir() if empty.
@@ -212,6 +216,103 @@ type Logger struct {
 	resolvedStat    func(string) (os.FileInfo, error)
 	resolvedRename  func(string, string) error
 	resolvedRemove  func(string) error
+}
+
+var patternConversionRegexps = []*regexp.Regexp{
+	regexp.MustCompile(`%[%+A-Za-z]`),
+	regexp.MustCompile(`\*+`),
+}
+
+func (c clockFn) Now() time.Time {
+	return c()
+}
+
+func NewLogger(p string, options ...Option) (*Logger, error) {
+	globPattern := p
+	for _, re := range patternConversionRegexps {
+		globPattern = re.ReplaceAllString(globPattern, "*")
+	}
+
+	pattern, err := NewStf(p)
+	if err != nil {
+		return nil, fmt.Errorf("invalid strftime pattern")
+	}
+
+	var clock Clock = Local
+
+	var maxAge int
+	var maxSize int = defaultMaxSize
+	var maxBackups int
+	var compress bool
+	var compression string
+	var rotateAtMinutes []int
+	var localTime bool
+	var rotationInterval time.Duration
+	var backupDateFormat string
+
+	for _, o := range options {
+		switch o.Name() {
+		case optkeyClock:
+			clock = o.Value().(Clock)
+		case optkeyMaxAge:
+			maxAge = o.Value().(int)
+			if maxAge < 0 {
+				maxAge = 0
+			}
+		case optKeyMaxSize:
+			maxSize = o.Value().(int)
+			if maxSize < 0 {
+				maxSize = 0
+			}
+		case optkeyMaxBackups:
+			maxBackups = o.Value().(int)
+			if maxBackups <= 0 {
+				maxBackups = defaultMaxBackUps
+			}
+		case optKeyCompress:
+			compress = o.Value().(bool)
+		case optKeyCompression:
+			compression = o.Value().(string)
+			if strings.TrimSpace(compression) == "" {
+				compression = "gzip"
+			}
+		case optKeyRotateAtMinutes:
+			rotateAtMinutes = o.Value().([]int)
+			if len(rotateAtMinutes) == 0 {
+				rotateAtMinutes = []int{0, 15, 30, 45}
+			}
+		case optkeyRotationTime:
+			rotationInterval = o.Value().(time.Duration)
+			if rotationInterval == 0 {
+				rotationInterval = 24 * time.Hour
+			}
+		case optKeyLocalTime:
+			localTime = o.Value().(bool)
+		case optKeyBackupTimeFormat:
+			backupDateFormat = o.Value().(string)
+			if strings.TrimSpace(backupDateFormat) == "" {
+				backupDateFormat = "2006-01-02-15-04-05"
+			}
+		}
+	}
+	logger := &Logger{
+		clock:              clock,
+		pattern:            pattern,
+		Filename:           globPattern,
+		MaxSize:            maxSize,    // megabytes
+		MaxBackups:         maxBackups, // backups
+		MaxAge:             maxAge,     // days
+		Compress:           compress,
+		Compression:        compression,                // "none" | "gzip" | "zstd" (preferred over legacy Compress)
+		LocalTime:          localTime,                  // default: false (use UTC)
+		RotationInterval:   rotationInterval,           // Rotate daily if no other rotation met
+		RotateAtMinutes:    rotateAtMinutes,            // Also rotate at HH:00, HH:15, HH:30, HH:45
+		RotateAt:           []string{"00:00", "12:00"}, // Also rotate at 00:00 and 12:00 each day
+		BackupTimeFormat:   backupDateFormat,           // Rotated files will have format <logfilename>-2006-01-02-15-04-05-<reason>.log
+		AppendTimeAfterExt: true,                       // put timestamp after ".log" (foo.log-<timestamp>-<reason>)
+		FileMode:           0o644,                      // Custom permissions for newly created files. If unset or 0, defaults to 640.
+	}
+	return logger, nil
 }
 
 var (
