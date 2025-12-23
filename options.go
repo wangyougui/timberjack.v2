@@ -113,7 +113,7 @@ func WithMaxAge(d int) Option {
 
 // WithRotationTime creates a new Option that sets the
 // time between rotation.
-func WithRotationTime(d int) Option {
+func WithRotationTime(d time.Duration) Option {
 	return option2.NewOption(optkeyRotationTime, d)
 }
 
