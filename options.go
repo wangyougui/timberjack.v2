@@ -14,6 +14,7 @@ const (
 	optKeyCompress         = "compress"
 	optKeyCompression      = "compression"
 	optKeyLocalTime        = "local-time"
+	optKeyPrefix           = "prefix"
 	optKeyRotationInterval = "rotation-interval"
 	optKeyRotateAtMinutes  = "rotate-at-minutes"
 	optKeyBackupTimeFormat = "backup-time-format"
@@ -152,4 +153,9 @@ func WithRotateAtMinutes(d []int) Option {
 
 func WithBackupTimeFormat(format string) Option {
 	return option2.NewOption(optKeyBackupTimeFormat, format)
+}
+
+// WithPrefix creates a new Option that sets the prefix of the log file.
+func WithPrefix(prefix string) Option {
+	return option2.NewOption(optKeyPrefix, prefix)
 }

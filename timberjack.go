@@ -100,8 +100,9 @@ type rotateAt [2]int
 //
 // timberjack assumes only a single process is writing to the log files at a time.
 type Logger struct {
-	clock   Clock
-	pattern *Strftime
+	clock       Clock
+	pattern     *Strftime
+	globPattern string
 	// Filename is the file to write logs to.  Backup log files will be retained
 	// in the same directory.  It uses <processname>-timberjack.log in
 	// os.TempDir() if empty.
@@ -117,7 +118,8 @@ type Logger struct {
 	// savings, leap seconds, etc. The default is not to remove old log files
 	// based on age.
 	MaxAge int `json:"maxage" yaml:"maxage"`
-
+	//历史文件保存数量
+	RotationCount uint `json:"rotationCount" yaml:"rotationCount"`
 	// MaxBackups is the maximum number of old log files to retain.  The default
 	// is to retain all old log files (though MaxAge may still cause them to get
 	// deleted.) MaxBackups counts distinct rotation events (timestamps).
@@ -250,7 +252,6 @@ func NewLogger(p string, options ...Option) (*Logger, error) {
 	var localTime bool
 	var rotationInterval time.Duration
 	var backupDateFormat string
-
 	for _, o := range options {
 		switch o.Name() {
 		case optkeyClock:
@@ -296,9 +297,11 @@ func NewLogger(p string, options ...Option) (*Logger, error) {
 			}
 		}
 	}
+
 	logger := &Logger{
 		clock:              clock,
 		pattern:            pattern,
+		globPattern:        globPattern,
 		Filename:           globPattern,
 		MaxSize:            maxSize,    // megabytes
 		MaxBackups:         maxBackups, // backups
@@ -1135,7 +1138,53 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	}
 	var logFiles []logInfo
 
-	prefix, ext := l.prefixAndExt() // Get prefix like "filename-" and original extension like ".log"
+	prefix, filePrefix, ext := l.prefixAndExt() // Get prefix like "filename-" and original extension like ".log"
+	matches, err := filepath.Glob(l.globPattern)
+	if err != nil {
+		return nil, err
+	}
+	cutoff := l.clock.Now().Add(-1 * time.Duration(l.MaxAge) * 24 * time.Hour)
+	toUnlink := make([]string, 0, len(matches))
+
+	for _, path := range matches {
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+
+		fl, err := os.Lstat(path)
+		if err != nil {
+			continue
+		}
+
+		fmt.Printf("file: %s %v \n", filePrefix, fi.ModTime().Format(backupTimeFormat))
+		if l.MaxAge > 0 && fi.ModTime().After(cutoff) {
+			continue
+		}
+
+		if l.RotationCount > 0 && fl.Mode()&os.ModeSymlink == os.ModeSymlink {
+			continue
+		}
+		toUnlink = append(toUnlink, path)
+	}
+
+	if l.RotationCount > 0 {
+		// Only delete if we have more than rotationCount
+		if l.RotationCount >= uint(len(toUnlink)) {
+			return logFiles, nil
+		}
+
+		toUnlink = toUnlink[:len(toUnlink)-int(l.RotationCount)]
+	}
+
+	for _, e := range toUnlink {
+		if fl, fileErr := os.Lstat(e); fileErr == nil {
+			t, errTime := l.timeNameWithoutZip(fl.Name(), filePrefix, ext)
+			if errTime == nil {
+				logFiles = append(logFiles, logInfo{t, fl})
+			}
+		}
+	}
 
 	for _, e := range entries {
 		if e.IsDir() { // Skip directories
@@ -1148,6 +1197,7 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 			continue // Skip files we can't stat
 		}
 
+		prefix = getFileName(name)
 		// Attempt to parse timestamp from filename (e.g., from "filename-timestamp-reason.log")
 		if t, errTime := l.timeFromName(name, prefix, ext); errTime == nil {
 			logFiles = append(logFiles, logInfo{t, info})
@@ -1168,6 +1218,35 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 
 	sort.Sort(byFormatTime(logFiles)) // Sorts newest first based on parsed timestamp
 	return logFiles, nil
+}
+
+func extractPrefix(filename string) string {
+	// 移除路径，只获取文件名
+	filename = filepath.Base(filename)
+
+	// 正则表达式匹配 XXX2025-12-25.log 格式
+	// 分解:
+	// ^([A-Za-z0-9]+)   - 开头是字母数字组合（捕获组1）
+	// [0-9]{4}          - 年份（4位数字）
+	// -                 - 分隔符
+	// [0-9]{2}          - 月份（2位数字）
+	// -                 - 分隔符
+	// [0-9]{2}          - 日期（2位数字）
+	// \\.log$           - 以.log结尾
+	re := regexp.MustCompile(`^([A-Za-z0-9]+)[0-9]{4}-[0-9]{2}-[0-9]{2}\.log$`)
+
+	// 执行匹配
+	matches := re.FindStringSubmatch(filename)
+	if matches != nil && len(matches) >= 2 {
+		return matches[1] // 返回第一个捕获组（前缀）
+	}
+
+	return ""
+}
+
+func getFileName(fileName string) string {
+	prefix := fileName[:strings.Index(fileName, ".")] + "-" // Add dash as backup filenames include it after original prefix
+	return prefix
 }
 
 // timeFromName extracts the formatted timestamp from the backup filename.
@@ -1225,6 +1304,45 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 	return time.ParseInLocation(layout, ts, loc)
 }
 
+// timeFromName extracts the formatted timestamp from the backup filename.
+// It expects filenames like "prefix-YYYY-MM-DDTHH-MM-SS.mmm-reason.ext" or "prefix.ext-YYYY-MM-DDTHH-MM-SS.mmm-reason[.gz]"
+func (l *Logger) timeNameWithoutZip(filename, prefix, ext string) (time.Time, error) {
+	layout := l.resolvedBackupLayout
+	layout = "2006-01-02"
+	loc := time.UTC
+	if l.resolvedLocalTime {
+		loc = time.Local
+	}
+	// nameNoComp must start with "<base>-"
+	if !strings.HasPrefix(filename, prefix) {
+		return time.Time{}, fmt.Errorf("malformed backup filename: %q", filename)
+	}
+	name := extractDate(filename)
+	return time.ParseInLocation(layout, name, loc)
+}
+
+// extractDate 从日志文件名提取日期
+func extractDate(filename string) string {
+	// 多种日期格式的正则表达式
+	patterns := []string{
+		`(\d{4}-\d{2}-\d{2})`, // YYYY-MM-DD
+		`(\d{4}/\d{2}/\d{2})`, // YYYY/MM/DD
+		`(\d{8})`,             // YYYYMMDD
+		`(\d{2}-\d{2}-\d{4})`, // DD-MM-YYYY
+		`(\d{2}/\d{2}/\d{4})`, // MM/DD/YYYY
+	}
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(filename)
+		if matches != nil && len(matches) >= 2 {
+			return matches[1]
+		}
+	}
+
+	return ""
+}
+
 // max returns the maximum size in bytes of log files before rolling.
 func (l *Logger) max() int64 {
 	if l.MaxSize == 0 { // If MaxSize is 0, use default.
@@ -1241,11 +1359,12 @@ func (l *Logger) dir() string {
 // prefixAndExt returns the filename part (up to the extension, with a trailing dash for backups)
 // and extension part from the Logger's filename.
 // e.g., for "foo.log", returns "foo-", ".log"
-func (l *Logger) prefixAndExt() (prefix, ext string) {
-	filename := filepath.Base(l.filename())
+func (l *Logger) prefixAndExt() (prefix, basePrefix, ext string) {
+	filename := filepath.Base(l.genFilename())
 	ext = filepath.Ext(filename)
 	prefix = filename[:len(filename)-len(ext)] + "-" // Add dash as backup filenames include it after original prefix
-	return prefix, ext
+	basePrefix = extractPrefix(filename)
+	return prefix, basePrefix, ext
 }
 
 // countDigitsAfterDot returns the number of consecutive digit characters
